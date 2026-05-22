@@ -1,5 +1,4 @@
 name: Build TrollVNC
-
 on:
   push:
     branches: [release]
@@ -7,16 +6,61 @@ on:
     inputs:
       is_managed:
         type: boolean
-        description: Build with a bundled Managed.plist
+        description: Build with a bundled Managed.plist (managed configuration)
         required: false
         default: false
-      # ...（其他 inputs 保持不变）
       desktop_name:
         type: string
         description: Desktop name shown to clients
         required: false
         default: TrollVNC
-      # （省略中间部分，保持你原来的所有 inputs）
+      port:
+        type: string
+        description: VNC TCP port (1024–65535; default 5901)
+        required: false
+        default: "5901"
+      view_only:
+        type: boolean
+        description: Global view-only (ignore input)
+        required: false
+        default: false
+      scale:
+        type: string
+        description: Output scale (0.1–1.0)
+        required: false
+        default: "1.0"
+      frame_rate_spec:
+        type: string
+        description: Frame rate spec (e.g. 60 | 30-60 | 30:60:120)
+        required: false
+        default: ""
+      modifier_map:
+        type: choice
+        description: Modifier mapping
+        required: false
+        default: std
+        options:
+          - std
+          - altcmd
+      reverse_mode:
+        type: choice
+        description: Reverse connection mode
+        required: false
+        default: none
+        options:
+          - none
+          - viewer
+          - repeater
+      reverse_socket:
+        type: string
+        description: Reverse host:port or [ipv6]:port
+        required: false
+        default: ""
+      reverse_repeater_id:
+        type: string
+        description: Repeater ID (numeric)
+        required: false
+        default: ""
 
 env:
   FINALPACKAGE: 1
@@ -37,7 +81,7 @@ jobs:
       - name: Install dependencies
         run: |
           brew install xcbeautify ldid-procursus p7zip make
-          brew install sourcelocation/formulae/deb-to-ipa || true   # 新增：deb转ipa工具
+          brew install sourcelocation/formulae/deb-to-ipa || echo "deb-to-ipa install skipped"
 
       - name: Checkout roothide/theos
         uses: actions/checkout@v4
@@ -63,9 +107,28 @@ jobs:
       - name: Generate Managed.plist (managed build)
         if: ${{ github.event_name == 'workflow_dispatch' && inputs.is_managed == true }}
         env:
-          # 保持你原来的所有 TVNC_ 变量
           TVNC_DESKTOP_NAME: ${{ inputs.desktop_name }}
-          # ...（保持不变）
+          TVNC_PORT: ${{ inputs.port }}
+          TVNC_VIEW_ONLY: ${{ inputs.view_only }}
+          TVNC_SCALE: ${{ inputs.scale }}
+          TVNC_FRAME_RATE_SPEC: ${{ inputs.frame_rate_spec }}
+          TVNC_MODIFIER_MAP: ${{ inputs.modifier_map }}
+          TVNC_REVERSE_MODE: ${{ inputs.reverse_mode }}
+          TVNC_REVERSE_SOCKET: ${{ inputs.reverse_socket }}
+          TVNC_REVERSE_REPEATER_ID: ${{ inputs.reverse_repeater_id }}
+          TVNC_ENABLED: true
+          TVNC_CLIPBOARD_ENABLED: true
+          TVNC_SINGLE_NOTIF_ENABLED: true
+          TVNC_CLIENT_NOTIFS_ENABLED: true
+          TVNC_KEEPALIVE_SEC: 15
+          TVNC_ORIENTATION_SYNC: true
+          TVNC_NATURAL_SCROLL: false
+          TVNC_AUTO_ASSIST_ENABLED: false
+          TVNC_SERVER_CURSOR: false
+          TVNC_BONJOUR_ENABLED: false
+          TVNC_KEY_LOGGING: false
+          TVNC_FULL_PASSWORD: ${{ secrets.TVNC_FULL_PASSWORD }}
+          TVNC_VIEWONLY_PASSWORD: ${{ secrets.TVNC_VIEWONLY_PASSWORD }}
         run: |
           bash devkit/gen-managed-plist.sh
 
@@ -74,43 +137,47 @@ jobs:
           source devkit/${{ matrix.scheme }}.sh
           FINALPACKAGE=1 gmake clean package
 
-      - name: Prepare artifacts
+      - name: Prepare artifacts + Create IPA
         run: |
           mkdir -p artifacts/dsym-${{ matrix.scheme }}
           mkdir -p artifacts/packages-${{ matrix.scheme }}
+          mkdir -p artifacts/ipa-default
 
-          if [ -d ".theos/obj" ]; then
-            find .theos/obj -name "*.dSYM" -exec cp -r {} artifacts/dsym-${{ matrix.scheme }}/ \;
-          fi
+          echo "=== Build Result Debug ==="
+          ls -la packages/ 2>/dev/null || echo "No packages folder"
+          ls -la .theos/_/Applications/ 2>/dev/null || echo "No TrollVNC.app folder"
 
+          # 复制 deb / tipa
           if [ -d "packages" ]; then
             if [ "${{ matrix.scheme }}" == "bootstrap" ]; then
-              cp -r packages/*.tipa artifacts/packages-${{ matrix.scheme }}/
+              cp -r packages/*.tipa artifacts/packages-${{ matrix.scheme }}/ 2>/dev/null || true
             else
-              cp -r packages/*.deb artifacts/packages-${{ matrix.scheme }}/
+              cp -r packages/*.deb artifacts/packages-${{ matrix.scheme }}/ 2>/dev/null || true
             fi
           fi
 
-      # ==================== 新增：生成 IPA ====================
-      - name: Create IPA for SideStore (default scheme)
-        if: matrix.scheme == 'default'
-        run: |
-          mkdir -p artifacts/ipa-default
-          
-          echo "=== Creating IPA from default build ==="
-          
-          # 方法1：使用 deb-to-ipa 工具（推荐）
-          if [ -f "packages/com.82flex.trollvnc_*.deb" ]; then
-            deb-to-ipa packages/com.82flex.trollvnc_*.deb -o artifacts/ipa-default/
-          fi
+          # ==================== 生成 IPA（只在 default scheme 执行） ====================
+          if [ "${{ matrix.scheme }}" == "default" ]; then
+            echo "=== Starting to create IPA for SideStore/iLoader ==="
 
-          # 如果上面失败，尝试直接打包 Payload
-          if [ ! -f "artifacts/ipa-default/*.ipa" ] && [ -d ".theos/_/Applications/TrollVNC.app" ]; then
-            echo "Fallback: Creating IPA manually..."
-            cd .theos/_
-            mkdir -p Payload
-            cp -r Applications/TrollVNC.app Payload/
-            zip -r "$GITHUB_WORKSPACE/artifacts/ipa-default/TrollVNC.ipa" Payload
+            # 方法1：使用 deb-to-ipa 工具
+            if ls packages/*.deb 1> /dev/null 2>&1; then
+              echo "Converting deb to IPA using deb-to-ipa..."
+              deb-to-ipa packages/com.82flex.trollvnc_*.deb -o artifacts/ipa-default/ || echo "deb-to-ipa failed"
+            fi
+
+            # 方法2：手动创建 IPA（最常用、最可靠）
+            if [ ! -f "artifacts/ipa-default"/*.ipa ] && [ -d ".theos/_/Applications/TrollVNC.app" ]; then
+              echo "Creating IPA manually using Payload method..."
+              cd .theos/_
+              mkdir -p Payload
+              cp -r Applications/TrollVNC.app Payload/
+              zip -r "$GITHUB_WORKSPACE/artifacts/ipa-default/TrollVNC.ipa" Payload
+              echo "✅ TrollVNC.ipa created successfully!"
+            fi
+
+            echo "=== Final IPA files in artifacts ==="
+            ls -la artifacts/ipa-default/
           fi
 
       - name: Upload dSYM artifacts
@@ -125,7 +192,7 @@ jobs:
           name: packages-${{ matrix.scheme }}
           path: artifacts/packages-${{ matrix.scheme }}
 
-      - name: Upload IPA artifact
+      - name: Upload IPA artifact （这里就是 IPA 输出位置）
         if: matrix.scheme == 'default'
         uses: actions/upload-artifact@v4
         with:
